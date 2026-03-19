@@ -23,8 +23,10 @@ WORKDIR /llama.cpp
 RUN cmake -B build \
     -DGGML_VULKAN=ON \
     -DGGML_NATIVE=ON \
-#    -DGGML_OPENMP=ON \
-    -DCMAKE_BUILD_TYPE=Release
+    -DGGML_OPENMP=ON \
+    -DLLAMA_MCP=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_BUILD_SERVER=ON
 
 RUN cmake --build build -j
 

@@ -16,3 +16,4 @@ langgraph
 sentence_transformers
 websocket-client
 PyQt6
+langchain-core

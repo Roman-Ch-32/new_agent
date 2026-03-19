@@ -1,7 +1,8 @@
 # src/main.py
+"""Main — FastAPI + WebSocket + Стриминг"""
+
 import json
 import re
-import traceback
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -13,14 +14,11 @@ from agent.config import config
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Lifespan контекст"""
     print("🚀 Запуск приложения...")
     from agent.agent import Agent
     app.state.agent = Agent()
     print("✅ Агент готов")
-
     yield
-
     print("🛑 Остановка приложения...")
 
 
@@ -48,57 +46,56 @@ async def ws(websocket: WebSocket):
             if not msg:
                 continue
 
-            print(f"📩 Получено сообщение: {msg[:50]}...")
+            # Отправляем что начали обработку
+            await websocket.send_json({
+                "type": "reasoning_start",
+                "status": "🤔 Думаю..."
+            })
 
-            # === Запуск LangGraph агента ===
+            # Вызываем агента (со стримингом если поддерживается)
             result = app.state.agent.invoke(
                 messages=[HumanMessage(content=msg)],
                 session_id=session_id,
             )
 
-            print(f"📤 Получен ответ: {result.result[:50] if result.result else 'EMPTY'}...")
+            # Извлекаем рассуждения и ответ
+            response_text = result.result
 
-            response_text = result.result if result.result else "Нет ответа"
+            reasoning = ""
+            reasoning_match = re.search(r'<reasoning>(.*?)</reasoning>', response_text, re.DOTALL | re.IGNORECASE)
+            if reasoning_match:
+                reasoning = reasoning_match.group(1).strip()
 
-            parsed = parse_reasoning(response_text)
+            answer = ""
+            answer_match = re.search(r'<answer>(.*?)</answer>|<reply>(.*?)</reply>', response_text,
+                                     re.DOTALL | re.IGNORECASE)
+            if answer_match:
+                answer = answer_match.group(1) or answer_match.group(2) or response_text
+            else:
+                answer = response_text
 
+            # Отправляем рассуждения
+            if reasoning:
+                await websocket.send_json({
+                    "type": "reasoning",
+                    "reasoning": reasoning,
+                    "has_reasoning": True
+                })
+
+            # Отправляем ответ
             await websocket.send_json({
                 "type": "reply",
-                "reply": parsed["answer"],
-                "reasoning": parsed["reasoning"],
-                "has_reasoning": parsed["has_reasoning"]
+                "reply": answer,
+                "reasoning": reasoning,
+                "has_reasoning": bool(reasoning)
             })
 
         except WebSocketDisconnect:
-            print(f"🔌 Клиент отключился (session: {session_id})")
+            print(f"🔌 Клиент отключился")
             break
 
         except Exception as e:
-            # ✅ Полное логирование ошибки
-            error_msg = str(e)
-            error_trace = traceback.format_exc()
-
-            print(f"\n❌ ОШИБКА: {error_msg}")
-            print(f"📋 TRACEBACK:\n{error_trace}\n")
-
-            try:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": error_msg if error_msg else "Неизвестная ошибка (см. логи сервера)",
-                    "traceback": error_trace  # Для отладки
-                })
-            except Exception as send_error:
-                print(f"⚠️ Не удалось отправить ошибку клиенту: {send_error}")
-                break
-
-
-def parse_reasoning(text: str) -> dict:
-    """Разделяет рассуждения и финальный ответ"""
-    reasoning = re.search(r'<reasoning>(.*?)</reasoning>', text, re.DOTALL)
-    answer = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
-
-    return {
-        "reasoning": reasoning.group(1).strip() if reasoning else "",
-        "answer": answer.group(1).strip() if answer else text,
-        "has_reasoning": bool(reasoning)
-    }
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e)
+            })

@@ -1,36 +1,6 @@
 # docker-compose.yml — минимальная рабочая версия
 services:
-  # 🧠 Ollama (LLM сервер)
-#  ollama:
-#    image: ollama/ollama:latest
-#    container_name: cartoon-ollama
-#    ports:
-#      - "11434:11434"
-#    volumes:
-#      # ✅ ПЕРСИСТЕНТНОСТЬ: сохраняем модели между перезапусками
-#      - ollama_models:/root/.ollama
-#      - /usr/share/vulkan:/usr/share/vulkan:ro  # ← Опционально
-#      # ✅ Ваша локальная модель (только для чтения)
-#      - "/home/roman/models/Qwen2.5-Coder-7B-Instruct-Q5_K_M.gguf:/models/model.gguf:ro"
-#      - "./docker/llama/entrypoint.sh:/entrypoint.sh"
-#    environment:
-#      - OLLAMA_HOST=0.0.0.0
-#      - OLLAMA_ORIGINS=*
-#      - OLLAMA_NUM_GPU=1
-#      - OLLAMA_GPU_LAYER=999
-#      - OLLAMA_VULKAN=1
-#      - GGML_VULKAN=1
-#      - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
-#      - MESA_LOADER_DRIVER_OVERRIDE=zink  # ← Альтернативный бэкенд (опционально)
-#    entrypoint: [ "/bin/sh", "/entrypoint.sh" ]
-#    networks:
-#      - cartoon-net
-#    devices:
-#      - /dev/dri:/dev/dri  # ← КРИТИЧНО: доступ к видеокарте
-#
-#    # 🔹 Группы для доступа к GPU
-#    group_add:
-#      - video    # ← Доступ к /dev/dri
+
   llama:
     build: ./docker/llama
     container_name: cartoon-llama
@@ -39,7 +9,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - /home/roman/models/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf:/models/model.gguf:ro
+      - /home/roman/models/deepseek-coder-v2-lite-instruct-q4_k_m.gguf:/models/model.gguf:ro
       - ./docker/llama/start.sh:/start.sh
     environment:
       - GGML_VULKAN=1

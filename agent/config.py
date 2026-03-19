@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 class LLMConfig:
     model: str = 'qwen-ue'
     base_url: str = 'http://localhost:8080/v1'
-    temperature: float = 0.7
+    temperature: float = 0.1
     top_p: float = 0.9
     num_predict: int = 2048
     repeat_penalty: float = 1.1
@@ -22,7 +22,7 @@ class QdrantConfig:
 
 @dataclass
 class ProjectConfig:
-    path: str = '/tmp/ue_project'
+    path: str = '/home/roman/Документы/Unreal Projects/мульт'
 
 
 @dataclass
@@ -30,7 +30,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     qdrant: QdrantConfig = field(default_factory=QdrantConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
-    debug: bool = False
+    debug: bool = True
 
 
 config = Config()
