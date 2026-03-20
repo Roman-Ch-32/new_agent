@@ -1,479 +1,371 @@
-# agent/agent.py
-"""AI Agent — JSON парсинг для llama.cpp (рабочая версия)"""
+"""Production-oriented planner/executor/verification agent."""
 
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any, List
-import re
+from typing import Any, Dict, List
 import json
+
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage, ToolMessage
-from langgraph.graph import StateGraph, END
+from langgraph.graph import END, StateGraph
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool, BaseTool
+from langchain_core.tools import BaseTool
 
 from agent.config import config
 from agent.state import AgentState, AgentStatus
-from agent.system_prompt import get_system_prompt
-from memory.session_store import SessionStore, SessionContext
+from agent.system_prompt import get_planner_prompt, get_responder_prompt
+from agent.tool_executor import ExecutionPlan, ToolExecutor
+from agent.tools import AgentTools
+from memory.session_store import SessionContext, SessionStore
 
-
-# ============================================================================
-# ИНСТРУМЕНТЫ (LangChain @tool)
-# ============================================================================
-
-@tool
-def index_directory(directory: str, project_name: str = "ue_project", recursive: bool = True,
-                    limit: int = None) -> dict:
-    """Индексирует директорию проекта в Qdrant"""
-    from mcp.indexer import FileIndexer
-    indexer = FileIndexer()
-    return indexer.index_directory(directory, project_name, recursive, limit)
-
-
-@tool
-def index_file(file_path: str, project_name: str = "ue_project") -> dict:
-    """Индексирует файл в Qdrant"""
-    from mcp.indexer import FileIndexer
-    indexer = FileIndexer()
-    return indexer.index_file(file_path, project_name)
-
-
-@tool
-def search_indexed(query: str, limit: int = 10) -> list:
-    """Поиск по проиндексированным файлам в Qdrant"""
-    from mcp.indexer import FileIndexer
-    indexer = FileIndexer()
-    return indexer.search_indexed(query, limit)
-
-
-@tool
-def get_project_structure(max_depth: int = 3) -> dict:
-    """Получить структуру проекта"""
-    from mcp.file_system import FileSystemTools
-    import os
-    tools = FileSystemTools(os.getcwd())
-    return tools.get_project_structure(max_depth)
-
-
-@tool
-def find_class(class_name: str) -> list:
-    """Найти класс в проекте"""
-    from mcp.code_analyzer import CodeAnalyzer
-    import os
-    analyzer = CodeAnalyzer(os.getcwd())
-    return analyzer.find_class(class_name)
-
-
-@tool
-def find_function(function_name: str) -> list:
-    """Найти функцию в проекте"""
-    from mcp.code_analyzer import CodeAnalyzer
-    import os
-    analyzer = CodeAnalyzer(os.getcwd())
-    return analyzer.find_function(function_name)
-
-
-@tool
-def read_file(file_path: str) -> str:
-    """Читать файл из проекта"""
-    from mcp.file_system import FileSystemTools
-    import os
-    tools = FileSystemTools(os.getcwd())
-    return tools.read_file(file_path)
-
-
-@tool
-def get_indexed_files(project_name: str = "ue_project") -> list:
-    """Список проиндексированных файлов"""
-    from mcp.indexer import FileIndexer
-    indexer = FileIndexer()
-    return indexer.get_indexed_files(project_name)
-
-
-@tool
-def search_duckduckgo(query: str, num_results: int = 5) -> list:
-    """Поиск в интернете"""
-    from mcp.internet_search import InternetSearch
-    search = InternetSearch()
-    return search.search_duckduckgo(query, num_results)
-
-
-ALL_TOOLS: list[BaseTool] = [
-    index_directory,
-    index_file,
-    search_indexed,
-    get_project_structure,
-    find_class,
-    find_function,
-    read_file,
-    get_indexed_files,
-    search_duckduckgo,
-]
-
-TOOLS_BY_NAME: dict[str, BaseTool] = {t.name: t for t in ALL_TOOLS}
-
-
-# ============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================================
-
-def _get_message_content(message: BaseMessage) -> str:
-    if not hasattr(message, 'content'):
-        return ''
-    content = message.content
-    if content is None:
-        return ''
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        texts = []
-        for item in content:
-            if isinstance(item, dict):
-                texts.append(str(item.get('text', item.get('content', ''))))
-            else:
-                texts.append(str(item))
-        return '\n'.join(texts)
-    return str(content)
-
-
-def _messages_to_dict(messages: list[BaseMessage]) -> list[dict]:
-    result = []
-    for msg in messages:
-        result.append({'type': type(msg).__name__, 'content': str(msg.content)})
-    return result
-
-
-def _dict_to_messages(data: list[dict]) -> list[BaseMessage]:
-    result = []
-    for item in data:
-        msg_type = item.get('type', 'HumanMessage')
-        content = item.get('content', '')
-        if msg_type == 'HumanMessage':
-            result.append(HumanMessage(content=content))
-        elif msg_type == 'AIMessage':
-            result.append(AIMessage(content=content))
-        elif msg_type == 'ToolMessage':
-            result.append(ToolMessage(content=content, tool_call_id=''))
-        elif msg_type == 'SystemMessage':
-            result.append(SystemMessage(content=content))
-    return result
-
-
-# ✅ ДОБАВЛЕН ПАРСЕР
-def _parse_tool_calls(text: str) -> list[dict]:
-    """
-    Парсит tool calls из текста LLM (для llama.cpp без нативных tool_calls)
-
-    Поддерживаемые форматы:
-    1. ```json {"tool": "...", "parameters": {...}} ```
-    2. {"tool": "...", "parameters": {...}}
-    """
-    if not text or not isinstance(text, str):
-        return []
-
-    tool_calls = []
-
-    # Формат 1: ```json {...}```
-    pattern1 = r'```json\s*(\{.*?"tool".*?\})\s*```'
-    matches1 = re.findall(pattern1, text, re.DOTALL)
-
-    for match_str in matches1:
-        try:
-            tool_call = json.loads(match_str)
-            tool_name = tool_call.get('tool', '')
-            if tool_name:
-                tool_calls.append({
-                    'name': tool_name,
-                    'args': tool_call.get('parameters', {})
-                })
-        except Exception as e:
-            pass
-
-    # Формат 2: Просто {...} с "tool" (без markdown)
-    if not tool_calls:
-        for match in re.finditer(r'\{[^{}]*"tool"[^{}]*\}', text, re.DOTALL):
-            try:
-                tool_call = json.loads(match.group())
-                tool_name = tool_call.get('tool', '')
-                if tool_name:
-                    tool_calls.append({
-                        'name': tool_name,
-                        'args': tool_call.get('parameters', {})
-                    })
-            except:
-                pass
-
-    return tool_calls
-
-
-# ============================================================================
-# АГЕНТ
-# ============================================================================
 
 @dataclass
 class Agent:
-    """AI Agent — JSON парсинг для llama.cpp"""
-
     qdrant_url: str = field(default_factory=lambda: getattr(config.qdrant, 'url', 'http://localhost:6333'))
     project_path: str = field(default_factory=lambda: getattr(config.project, 'path', '/tmp'))
     debug: bool = field(default_factory=lambda: getattr(config, 'debug', True))
+    max_iterations: int = 6
+    max_actions_per_plan: int = 3
     llm: ChatOpenAI = field(init=False)
     session_store: SessionStore = field(init=False)
     graph: Any = field(init=False)
-    system_prompt: str = field(init=False)
+    tools: AgentTools = field(init=False)
+    tools_dict: Dict[str, BaseTool] = field(init=False)
+    tool_executor: ToolExecutor = field(init=False)
 
     def __post_init__(self) -> None:
-        if self.debug:
-            print(f"\n{'=' * 60}")
-            print(f"[AGENT] Инициализация...")
-            print(f"[AGENT] Project path: {self.project_path}")
-            print(f"[AGENT] Qdrant URL: {self.qdrant_url}")
-
-        self.system_prompt = get_system_prompt(self.project_path)
         self.llm = self._create_llm()
-
-        # ❌ bind_tools() НЕ РАБОТАЕТ с llama.cpp — не используем
-        # self.llm_with_tools = self.llm.bind_tools(ALL_TOOLS)
-
+        self.tools = AgentTools()
+        self.tools_dict = self.tools.get_tools_by_name()
+        self.tool_executor = ToolExecutor(self.tools_dict, debug=self.debug)
         self.session_store = SessionStore(self.qdrant_url)
         self.graph = self._build_graph()
-
-        if self.debug:
-            print(f"[AGENT] Готов! Инструментов: {len(ALL_TOOLS)}")
-            print(f"{'=' * 60}\n")
 
     def _create_llm(self) -> ChatOpenAI:
         return ChatOpenAI(
             model=getattr(config.llm, 'model', 'qwen-ue'),
             base_url=getattr(config.llm, 'base_url', 'http://localhost:8080/v1'),
-            temperature=getattr(config.llm, 'temperature', 0.1),
+            temperature=getattr(config.llm, 'temperature', 0.03),
             api_key='sk-no-key-required',
             top_p=getattr(config.llm, 'top_p', 0.9),
             max_tokens=getattr(config.llm, 'num_predict', 2048),
         )
 
-    def _llm_node(self, state: AgentState) -> dict:
-        """LLM генерирует ответ"""
-        query = _get_message_content(state.messages[-1]) if state.messages else ''
+    def _append_trace(self, state: AgentState, *events: Dict[str, Any]) -> List[Dict[str, Any]]:
+        trace = list(state.trace_events or [])
+        trace.extend(events)
+        return trace
 
-        if not query:
-            return {'messages': state.messages, 'status': AgentStatus.SUCCESS, 'result': ''}
+    def _get_tools_list_for_prompt(self) -> str:
+        items = []
+        for name, tool in self.tools_dict.items():
+            desc = (tool.description or 'Нет описания').splitlines()[0]
+            items.append(f'- {name}: {desc}')
+        return '\n'.join(items)
 
-        if self.debug:
-            print(f"\n[LLM] Запрос: {query[:100]}...")
+    def _candidate_json_strings(self, text: str) -> List[str]:
+        candidates: List[str] = []
+        stripped = text.strip()
+        if stripped:
+            candidates.append(stripped)
 
-        system_msg = SystemMessage(content=self.system_prompt)
-        messages = [system_msg] + list(state.messages)
+        if '```' in text:
+            for block in text.split('```'):
+                block = block.strip()
+                if not block:
+                    continue
+                if block.lower().startswith('json'):
+                    block = block[4:].strip()
+                candidates.append(block)
 
-        # ✅ Обычный invoke (не llm_with_tools)
-        response = self.llm.invoke(messages)
+        start = text.find('{')
+        while start != -1:
+            depth = 0
+            for idx in range(start, len(text)):
+                ch = text[idx]
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(text[start:idx + 1])
+                        break
+            start = text.find('{', start + 1)
 
-        # ✅ Парсинг JSON из текста
-        tool_calls = _parse_tool_calls(response.content)
+        uniq: List[str] = []
+        seen = set()
+        for c in candidates:
+            if c not in seen:
+                uniq.append(c)
+                seen.add(c)
+        return uniq
 
-        if self.debug:
-            print(f"[LLM] Найдено tool calls: {len(tool_calls)}")
-            for tc in tool_calls:
-                print(f"  - {tc['name']}: {tc['args']}")
-            print(f"[LLM] Content: {response.content[:300] if response.content else 'None'}...")
+    def _normalize_plan(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        actions = parsed.get('actions', [])
+        normalized_actions = []
+        if isinstance(actions, list):
+            for action in actions[: self.max_actions_per_plan]:
+                if not isinstance(action, dict):
+                    continue
+                tool = action.get('tool')
+                params = action.get('parameters', {})
+                if isinstance(tool, str) and tool in self.tools_dict and isinstance(params, dict):
+                    normalized_actions.append({'tool': tool, 'parameters': params})
 
-        return {
-            'messages': [response],
-            'status': AgentStatus.SUCCESS,
-            'result': response.content if response.content else '',
-        }
+        done = bool(parsed.get('done', False))
+        final_message = str(parsed.get('final_message', '') or '')
+        if normalized_actions:
+            done = False
+        return {'actions': normalized_actions, 'done': done, 'final_message': final_message}
 
-    def _tool_executor_node(self, state: AgentState) -> dict:
-        """Выполняет tool calls"""
-        last_message = state.messages[-1] if state.messages else None
-
-        if not last_message or not last_message.content:
-            return {'messages': state.messages, 'status': AgentStatus.SUCCESS}
-
-        # ✅ Парсинг JSON из текста
-        tool_calls = _parse_tool_calls(last_message.content)
-
-        if self.debug:
-            print(f"\n[TOOL] Выполняю {len(tool_calls)} инструментов")
-
-        if not tool_calls:
-            return {'messages': state.messages, 'status': AgentStatus.SUCCESS}
-
-        tool_results = []
-        for tool_call in tool_calls:
-            tool_name = tool_call.get('name')
-            tool_args = tool_call.get('args', {})
-
-            if self.debug:
-                print(f"[TOOL] Вызываю: {tool_name}({tool_args})")
-
+    def _repair_planner_json(self, raw_text: str) -> Dict[str, Any]:
+        repair_prompt = (
+            'Исправь ответ planner и верни только валидный JSON без пояснений. '
+            'Схема: {"actions": [{"tool": "name", "parameters": {}}], "done": false, "final_message": ""}. '
+            f'Допустимые инструменты: {", ".join(self.tools.get_tool_names())}.\n\n'
+            f'Сломанный ответ:\n{raw_text}'
+        )
+        repaired = self.llm.invoke([HumanMessage(content=repair_prompt)])
+        for candidate in self._candidate_json_strings(str(repaired.content)):
             try:
-                tool_func = TOOLS_BY_NAME.get(tool_name)
-                if tool_func:
-                    result = tool_func.invoke(tool_args)
-                    tool_results.append({
-                        'tool': tool_name,
-                        'result': result
-                    })
-                    if self.debug:
-                        print(f"[TOOL] Результат: {str(result)[:300]}")
+                return self._normalize_plan(json.loads(candidate))
+            except Exception:
+                continue
+        return {'actions': [], 'done': True, 'final_message': 'Planner не вернул корректный JSON-план.'}
+
+    def _parse_planner_json(self, text: str) -> Dict[str, Any]:
+        if not text or not isinstance(text, str):
+            return {'actions': [], 'done': True, 'final_message': 'Пустой ответ planner.'}
+
+        for candidate in self._candidate_json_strings(text):
+            try:
+                return self._normalize_plan(json.loads(candidate))
+            except Exception:
+                continue
+        return self._repair_planner_json(text)
+
+    def _planner_node(self, state: AgentState) -> Dict[str, Any]:
+        query = state.get_last_user_message() or state.current_task
+        if not query:
+            return {'status': AgentStatus.SUCCESS, 'result': '', 'trace_events': state.trace_events}
+
+        system_prompt = get_planner_prompt(
+            project_path=self.project_path,
+            tools_list=self._get_tools_list_for_prompt(),
+            max_actions=self.max_actions_per_plan,
+        )
+
+        response = self.llm.invoke([SystemMessage(content=system_prompt)] + list(state.messages))
+        plan = self._parse_planner_json(str(response.content))
+        plan_json = json.dumps(plan, ensure_ascii=False)
+
+        trace_events = self._append_trace(
+            state,
+            {'type': 'plan', 'iteration': state.fix_iterations + 1, 'plan': plan},
+        )
+
+        return {
+            'messages': list(state.messages) + [AIMessage(content=plan_json)],
+            'plan': plan,
+            'status': AgentStatus.PLANNING,
+            'fix_iterations': state.fix_iterations + 1,
+            'current_task': query,
+            'trace_events': trace_events,
+        }
+
+    def _planner_router(self, state: AgentState) -> str:
+        if state.is_max_iterations_reached(self.max_iterations):
+            return 'responder'
+        if state.plan.get('actions'):
+            return 'executor'
+        return 'responder'
+
+    def _executor_node(self, state: AgentState) -> Dict[str, Any]:
+        actions = state.plan.get('actions', []) if state.plan else []
+        trace = list(state.trace_events or [])
+        for action in actions:
+            trace.append({'type': 'tool_call', 'tool': action.get('tool'), 'parameters': action.get('parameters', {})})
+
+        execution = self.tool_executor.execute_plan(ExecutionPlan(actions=actions, max_retries=1))
+        results_text = self.tool_executor.get_results_for_responder()
+
+        for item in execution.get('execution_history', []):
+            trace.append({
+                'type': 'tool_result',
+                'tool': item.tool_name,
+                'success': item.success,
+                'result': str(item.result)[:1500] if item.result is not None else '',
+                'error': item.error,
+            })
+
+        return {
+            'messages': list(state.messages) + [ToolMessage(content=results_text, tool_call_id='execution_plan')],
+            'tool_results': results_text,
+            'execution_result': execution,
+            'status': AgentStatus.EXECUTING if execution.get('success') else AgentStatus.RETRY,
+            'trace_events': trace,
+        }
+
+    def _verification_node(self, state: AgentState) -> Dict[str, Any]:
+        execution = state.execution_result or {}
+        success = bool(execution.get('success'))
+        summary_parts = []
+        diff_text = ''
+        diff_stat = ''
+        git_info: Dict[str, Any] = {}
+        trace = list(state.trace_events or [])
+
+        if success:
+            summary_parts.append('Исполнение плана завершилось без ошибок инструмента.')
+        else:
+            summary_parts.append(f'Исполнение завершилось ошибкой: {execution.get("error", "неизвестно")}.')
+
+        if self.tools.git:
+            try:
+                status = self.tools.git.get_status()
+                git_info['status'] = status
+                summary_parts.append(f"Текущая ветка: {status.get('branch', 'unknown')}. Изменённых файлов: {len(status.get('changed_files', [])) + len(status.get('untracked_files', []))}.")
+
+                branches = set(self.tools.git.get_branches(False))
+                current_branch = status.get('branch')
+                base_branch = 'main' if 'main' in branches else 'master' if 'master' in branches else None
+                if current_branch and base_branch and current_branch != base_branch:
+                    diff_payload = self.tools.git.diff(current_branch, base_branch)
+                    if isinstance(diff_payload, dict) and diff_payload.get('success'):
+                        diff_text = diff_payload.get('diff', '')
+                        diff_stat = diff_payload.get('stat', '')
+                        if diff_text or diff_stat:
+                            summary_parts.append(f'Есть diff относительно {base_branch}.')
+                            trace.append({
+                                'type': 'diff',
+                                'branch': current_branch,
+                                'base_branch': base_branch,
+                                'stat': diff_stat[:2000],
+                                'diff': diff_text[:4000],
+                            })
             except Exception as e:
-                if self.debug:
-                    print(f"[TOOL] Ошибка: {e}")
-                tool_results.append({
-                    'tool': tool_name,
-                    'result': {'error': str(e)}
-                })
+                summary_parts.append(f'Git verification не удалась: {e}')
 
-        results_text = "\n\n📎 РЕЗУЛЬТАТЫ ИНСТРУМЕНТОВ:\n"
-        for tr in tool_results:
-            results_text += f"\n### {tr['tool']}:\n{str(tr['result'])[:2000]}\n"
-
-        tool_message = ToolMessage(content=results_text, tool_call_id='')
-        new_messages = list(state.messages) + [tool_message]
-
-        return {
-            'messages': new_messages,
-            'status': AgentStatus.SUCCESS,
+        verification_result = {
+            'success': success,
+            'need_replan': not success and not state.is_max_iterations_reached(self.max_iterations),
+            'continue_planning': success and bool(state.plan.get('actions')) and not state.is_max_iterations_reached(self.max_iterations),
+            'summary': ' '.join(summary_parts),
+            'git': git_info,
+            'diff': diff_text[:4000],
+            'diff_stat': diff_stat[:2000],
         }
 
-    def _final_answer_node(self, state: AgentState) -> dict:
-        """Финальный ответ — форматирует результаты для пользователя"""
-        if self.debug:
-            print("\n[LLM] Финальный ответ...")
+        trace.append({'type': 'verification', 'verification': verification_result})
 
-        last_message = state.messages[-1] if state.messages else None
+        return {
+            'verification_result': verification_result,
+            'status': AgentStatus.VERIFYING,
+            'trace_events': trace,
+            'plan': {},
+        }
 
-        # ✅ Если были результаты инструментов — форматируем их красиво
-        if state.rag_context and any(c.get('type') == 'tool_results' for c in state.rag_context):
-            if self.debug:
-                print(f"[LLM] Форматируем результаты инструментов...")
+    def _verification_router(self, state: AgentState) -> str:
+        verification = state.verification_result or {}
+        if state.is_max_iterations_reached(self.max_iterations):
+            return 'responder'
+        if verification.get('need_replan'):
+            return 'planner'
+        if verification.get('continue_planning'):
+            return 'planner'
+        return 'responder'
 
-            system_msg = SystemMessage(
-                content="""Ты — AI-ассистент. Отформатируй результаты инструментов в понятный ответ на русском языке.
+    def _responder_node(self, state: AgentState) -> Dict[str, Any]:
+        rag_context = '\n'.join(str(c) for c in (state.rag_context or [])[:3])
+        verification_summary = json.dumps(state.verification_result or {}, ensure_ascii=False, indent=2)
+        plan_json = json.dumps(state.plan or {}, ensure_ascii=False, indent=2)
 
-    ПРАВИЛА:
-    1. НЕ показывай сырые JSON/словари
-    2. Используй человеческий язык
-    3. Выделяй важное жирным
-    4. Будь кратким но информативным
-
-    ПРИМЕР:
-    Вместо: [{'path': '/file.cpp', 'chunks': 5}]
-    Пиши: ✅ Найдено 1 файл: file.cpp (5 чанков)
-    """
+        final_message = (state.plan or {}).get('final_message', '')
+        if final_message and not state.tool_results:
+            result_text = final_message
+        else:
+            prompt = get_responder_prompt(
+                plan_json=plan_json,
+                tool_results=state.tool_results or 'Нет результатов инструментов.',
+                verification_summary=verification_summary,
+                rag_context=rag_context,
             )
-            messages = [system_msg] + list(state.messages)
-
-            response = self.llm.invoke(messages)
-
-            return {
-                'messages': [response],
-                'result': response.content,
-                'status': AgentStatus.SUCCESS,
-            }
-
-        # ✅ Если нет результатов инструментов — используем контент LLM
-        if last_message and hasattr(last_message, 'content') and last_message.content:
-            if self.debug:
-                print(f"[LLM] Используем существующий контент")
-
-            return {
-                'messages': state.messages,
-                'result': last_message.content,
-                'status': AgentStatus.SUCCESS,
-            }
+            response = self.llm.invoke([SystemMessage(content=prompt)] + list(state.messages))
+            result_text = str(response.content)
 
         return {
-            'messages': state.messages,
-            'result': state.result or 'Готово',
+            'messages': list(state.messages),
+            'result': result_text,
             'status': AgentStatus.SUCCESS,
         }
-
-    def _router(self, state: AgentState) -> str:
-        """Роутинг"""
-        last_message = state.messages[-1] if state.messages else None
-
-        if not last_message or not last_message.content:
-            return 'final_answer'
-
-        # ✅ Парсинг для роутинга
-        tool_calls = _parse_tool_calls(last_message.content)
-
-        if self.debug:
-            print(f"\n[ROUTER] tool_calls: {len(tool_calls)}")
-
-        if tool_calls:
-            return 'execute_tools'
-
-        return 'final_answer'
 
     def _build_graph(self):
         workflow = StateGraph(AgentState)
+        workflow.add_node('planner', self._planner_node)
+        workflow.add_node('executor', self._executor_node)
+        workflow.add_node('verification', self._verification_node)
+        workflow.add_node('responder', self._responder_node)
 
-        workflow.add_node('llm', self._llm_node)
-        workflow.add_node('execute_tools', self._tool_executor_node)
-        workflow.add_node('final_answer', self._final_answer_node)
-
-        workflow.set_entry_point('llm')
-        workflow.add_conditional_edges('llm', self._router, {
-            'execute_tools': 'execute_tools',
-            'final_answer': 'final_answer',
-        })
-        workflow.add_edge('execute_tools', 'final_answer')
-        workflow.add_edge('final_answer', END)
-
+        workflow.set_entry_point('planner')
+        workflow.add_conditional_edges('planner', self._planner_router, {'executor': 'executor', 'responder': 'responder'})
+        workflow.add_edge('executor', 'verification')
+        workflow.add_conditional_edges('verification', self._verification_router, {'planner': 'planner', 'responder': 'responder'})
+        workflow.add_edge('responder', END)
         return workflow.compile()
 
-    def invoke(self, messages=None, session_id='default', **kwargs):
-        """Вызов агента"""
-        if self.debug:
-            print(f"\n{'=' * 60}")
-            print(f"[INVOKE] Session: {session_id}")
-            print(f"{'=' * 60}")
+    def _messages_to_dict(self, messages: List[BaseMessage]) -> List[dict]:
+        result = []
+        for msg in messages:
+            result.append({'type': type(msg).__name__, 'content': str(msg.content)})
+        return result
 
-        session_ctx = self.session_store.get(session_id)
-        if not session_ctx:
-            session_ctx = SessionContext(session_id=session_id)
+    def _dict_to_messages(self, data: List[dict]) -> List[BaseMessage]:
+        result: List[BaseMessage] = []
+        for item in data:
+            msg_type = item.get('type', 'HumanMessage')
+            content = item.get('content', '')
+            if msg_type == 'HumanMessage':
+                result.append(HumanMessage(content=content))
+            elif msg_type == 'AIMessage':
+                result.append(AIMessage(content=content))
+            elif msg_type == 'ToolMessage':
+                result.append(ToolMessage(content=content, tool_call_id='restored'))
+            elif msg_type == 'SystemMessage':
+                result.append(SystemMessage(content=content))
+        return result
 
-        stored_messages = []
-        if session_ctx.messages:
-            stored_messages = _dict_to_messages(session_ctx.messages)
-
+    def invoke(self, messages=None, session_id: str = 'default', **kwargs):
+        session_ctx = self.session_store.get(session_id) or SessionContext(session_id=session_id)
+        stored_messages = self._dict_to_messages(session_ctx.messages) if session_ctx.messages else []
         all_messages = stored_messages + (messages or [])
 
         initial_state = AgentState(
             messages=all_messages,
             rag_context=session_ctx.accumulated_context or [],
             token_usage=session_ctx.token_usage or {},
-            fix_iterations=session_ctx.fix_iterations,
-            **kwargs
+            fix_iterations=0,
+            plan={},
+            tool_results='',
+            execution_result={},
+            verification_result={},
+            trace_events=[],
+            status=AgentStatus.IDLE,
+            result='',
+            ue_project_path=self.project_path,
         )
 
         result_dict = self.graph.invoke(initial_state)
+        result = AgentState.model_validate(result_dict) if isinstance(result_dict, dict) else result_dict
 
-        if isinstance(result_dict, dict):
-            result = AgentState.model_validate(result_dict)
-        else:
-            result = result_dict
-
-        if self.debug:
-            print(f"\n[INVOKE] Результат тип: {type(result)}")
-            print(f"[INVOKE] Messages: {len(result.messages) if result.messages else 0}")
-            print(f"[INVOKE] Result: {result.result[:100] if result.result else 'None'}...")
-            print(f"{'=' * 60}\n")
-
-        messages_list = list(result.messages) if result.messages else []
         new_ctx = SessionContext(
             session_id=session_id,
-            messages=_messages_to_dict(messages_list),
+            messages=self._messages_to_dict(list(result.messages) if result.messages else []),
             accumulated_context=result.rag_context or [],
             token_usage=result.token_usage or {},
             fix_iterations=result.fix_iterations,
         )
         self.session_store.save(new_ctx)
-
         return result
 
-    def clear_session(self, session_id='default'):
+    def clear_session(self, session_id: str = 'default'):
         self.session_store.delete(session_id)

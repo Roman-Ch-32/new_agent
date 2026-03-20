@@ -1,11 +1,11 @@
 # mcp/indexer.py
-"""File Indexer — Индексация файлов проекта в Qdrant (полная версия)"""
+"""File Indexer — Индексация файлов и папок проекта в Qdrant"""
 
 import hashlib
 import json
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -21,19 +21,40 @@ from sentence_transformers import SentenceTransformer
 class FileIndexer:
     """Индексатор файлов для RAG поиска"""
 
+    # ✅ Игнорируемые расширения (бинарники, кэш, логи)
     IGNORE_EXTENSIONS = {
-        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tga', '.exr',
-        '.ini', '.dll', '.so', '.exe', '.bin', '.dat',
-        '.cache', '.log', '.pdb', '.pch', '.obj', '.lib',
-        '.dds', '.texp', '.shader', '.usmap', '.uproject'
+        '.dll', '.so', '.exe', '.bin', '.dat', '.dylib',
+        '.pdb', '.pch', '.obj', '.lib', '.a', '.o',
+        '.cache', '.tmp', '.swp', '.swo',
+        '.png', '.jpg', '.jpeg', '.tga', '.dds', '.exr',
+        '.log',
     }
 
-    BINARY_UE_FILES = {'.uasset', '.umap', }
+    # ✅ UE бинарные ассеты (обрабатываем отдельно)
+    BINARY_UE_FILES = {'.uasset', '.umap'}
 
+    # ✅ Текстовые файлы которые ВСЕГДА индексируем
+    TEXT_EXTENSIONS = {
+        '.uproject', '.uplugin',
+        '.ini',
+        '.cpp', '.h', '.hpp', '.cc', '.cxx',
+        '.cs',
+        '.py',
+        '.txt', '.md', '.json', '.xml', '.yaml', '.yml',
+        '.shader', '.hlsl', '.glsl',
+        '.anim', '.state', '.graph',
+    }
+
+    # ✅ Игнорируемые папки
     IGNORE_DIRS = {
-        'Binaries', 'Intermediate', 'Saved', 'DerivedDataCache',
-        '.git', '.svn', '__pycache__', 'node_modules', '.venv',
-        'Content/Developers', 'Content/Engine', 'Plugins/Engine'
+        'Binaries',
+        'Intermediate',
+        'DerivedDataCache',
+        'Saved',
+        '.git',
+        '__pycache__',
+        'node_modules',
+        '.venv', 'venv',
     }
 
     def __init__(
@@ -61,38 +82,47 @@ class FileIndexer:
         except Exception as e:
             print(f"⚠️ Warning: {e}")
 
-    # ========================================================================
-    # ИНДЕКСАЦИЯ
-    # ========================================================================
-
     def _should_ignore(self, path: Path) -> bool:
-        """Проверяет нужно ли игнорировать файл"""
+        """Проверяет нужно ли игнорировать файл или папку"""
+
+        # ✅ Проверяем папки в пути
         for part in path.parts:
             if part in self.IGNORE_DIRS:
                 return True
 
+        # ✅ Если это папка — не игнорируем (будем индексировать структуру)
+        if path.is_dir():
+            return False
+
         suffix = path.suffix.lower()
+
+        # ✅ Текстовые файлы — всегда индексируем
+        if suffix in self.TEXT_EXTENSIONS:
+            return False
+
+        # ✅ UE бинарные ассеты — пробуем прочитать заголовок
         if suffix in self.BINARY_UE_FILES:
             return False
 
+        # ✅ Игнорируем по расширению
         if suffix in self.IGNORE_EXTENSIONS:
             return True
 
+        # ✅ Пропускаем очень большие файлы (>5MB)
         try:
             if path.stat().st_size > 5 * 1024 * 1024:
                 return True
         except:
             pass
 
-        return False
+        # ✅ Неизвестные расширения — игнорируем
+        return True
 
     def _read_file(self, path: Path) -> Optional[str]:
         """Читает содержимое файла"""
         suffix = path.suffix.lower()
-        """Читает содержимое файла"""
-        suffix = path.suffix.lower()
 
-        # ✅ Читаем .ini файлы
+        # ✅ .ini — конфиги
         if suffix == '.ini':
             try:
                 with open(path, 'r', encoding='utf-8') as f:
@@ -100,7 +130,8 @@ class FileIndexer:
             except:
                 return None
 
-        if suffix == '.uproject':
+        # ✅ .uproject / .uplugin — JSON
+        if suffix in ('.uproject', '.uplugin'):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -108,6 +139,7 @@ class FileIndexer:
             except:
                 return None
 
+        # ✅ UE бинарные ассеты — только заголовок
         if suffix in self.BINARY_UE_FILES:
             try:
                 with open(path, 'rb') as f:
@@ -121,6 +153,7 @@ class FileIndexer:
                 pass
             return None
 
+        # ✅ Текстовые файлы — читаем с разными кодировками
         try:
             for encoding in ['utf-8', 'cp1251', 'latin-1']:
                 try:
@@ -155,6 +188,71 @@ class FileIndexer:
             start = end - overlap
 
         return chunks
+
+    def _index_directory_structure(self, dir_path: Path, project_name: str = 'default') -> Dict[str, Any]:
+        """Индексирует структуру папки как отдельную запись"""
+        if not dir_path.exists() or not dir_path.is_dir():
+            return {'status': 'error', 'message': f'Not a directory: {dir_path}'}
+
+        # ✅ Собираем информацию о папке
+        try:
+            subdirs = [d.name for d in dir_path.iterdir() if d.is_dir() and d.name not in self.IGNORE_DIRS]
+            files = [f.name for f in dir_path.iterdir() if f.is_file() and not self._should_ignore(f)]
+        except PermissionError:
+            return {'status': 'error', 'message': f'Permission denied: {dir_path}'}
+
+        # ✅ Создаём текстовое описание папки
+        description = f"Directory: {dir_path.name}\n"
+        description += f"Path: {str(dir_path.absolute())}\n"
+
+        if subdirs:
+            description += f"Subdirectories: {', '.join(sorted(subdirs))}\n"
+        else:
+            description += "Subdirectories: none\n"
+
+        if files:
+            file_exts = {}
+            for f in files:
+                ext = Path(f).suffix.lower() or 'no_extension'
+                file_exts[ext] = file_exts.get(ext, 0) + 1
+            description += f"Files: {len(files)} total ("
+            description += ', '.join(f"{count} {ext}" for ext, count in sorted(file_exts.items()))
+            description += ")\n"
+            description += f"File names: {', '.join(sorted(files)[:20])}"
+        else:
+            description += "Files: none\n"
+
+        # ✅ Создаём эмбеддинг и сохраняем в Qdrant
+        embedding = self.model.encode(description, normalize_embeddings=True)
+        vector = list(embedding)
+
+        payload = {
+            'path': str(dir_path.absolute()),
+            'file_name': dir_path.name,
+            'file_ext': '.directory',
+            'project': project_name,
+            'chunk_index': 0,
+            'total_chunks': 1,
+            'content': description,
+            'type': 'directory',
+            'subdirectories': subdirs,
+            'files_count': len(files),
+            'indexed_at': time.time()
+        }
+
+        point_id = int(hashlib.md5(f"{dir_path.absolute()}:dir".encode()).hexdigest(), 16) % (10 ** 9)
+
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=[PointStruct(id=point_id, vector=vector, payload=payload)]
+        )
+
+        return {
+            'status': 'indexed',
+            'path': str(dir_path),
+            'subdirs': len(subdirs),
+            'files': len(files)
+        }
 
     def index_file(self, file_path: str, project_name: str = 'default') -> Dict[str, Any]:
         """Индексирует один файл"""
@@ -191,7 +289,8 @@ class FileIndexer:
                 'total_chunks': len(chunks),
                 'content': chunk,
                 'file_hash': hashlib.md5(f"{path.absolute()}:{i}".encode()).hexdigest(),
-                'indexed_at': time.time()
+                'indexed_at': time.time(),
+                'type': 'file'
             }
 
             point_id = int(hashlib.md5(f"{path.absolute()}:{i}".encode()).hexdigest(), 16) % (10 ** 9)
@@ -218,25 +317,70 @@ class FileIndexer:
             recursive: bool = True,
             limit: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Индексирует всю директорию"""
+        """Индексирует всю директорию (файлы + папки)"""
         dir_path = Path(directory)
 
         if not dir_path.exists():
             return {'status': 'error', 'message': f'Directory not found: {directory}'}
 
-        stats = {'indexed': 0, 'skipped': 0, 'errors': 0, 'files': []}
+        stats = {
+            'indexed': 0,
+            'skipped': 0,
+            'errors': 0,
+            'files': [],
+            'directories': [],
+            'skip_reasons': {}
+        }
 
-        files = list(dir_path.rglob('*')) if recursive else list(dir_path.glob('*'))
-        total = len([f for f in files if f.is_file()])
+        all_items = list(dir_path.rglob('*')) if recursive else list(dir_path.glob('*'))
+        total_files = len([f for f in all_items if f.is_file()])
+        total_dirs = len([d for d in all_items if d.is_dir()])
+
+        print(f"📂 Найдено: {total_files} файлов, {total_dirs} папок")
 
         processed = 0
-        for file_path in files:
+
+        # ✅ 1. Сначала индексируем папки (структуру)
+        dirs_to_index = [d for d in all_items if d.is_dir() and not self._should_ignore(d)]
+
+        if recursive:
+            dirs_to_index.insert(0, dir_path)
+
+        for dir_path_item in dirs_to_index:
+            if limit and processed >= limit:
+                break
+
+            result = self._index_directory_structure(dir_path_item, project_name)
+
+            if result.get('status') == 'indexed':
+                stats['directories'].append({
+                    'path': str(dir_path_item),
+                    'subdirs': result.get('subdirs', 0),
+                    'files': result.get('files', 0)
+                })
+                stats['indexed'] += 1
+
+            processed += 1
+
+        # ✅ 2. Затем индексируем файлы
+        for file_path in all_items:
             if limit and processed >= limit:
                 break
 
             if file_path.is_file():
                 if self._should_ignore(file_path):
                     stats['skipped'] += 1
+
+                    suffix = file_path.suffix.lower()
+                    if suffix in self.IGNORE_EXTENSIONS:
+                        reason = f'ext:{suffix}'
+                    elif any(part in self.IGNORE_DIRS for part in file_path.parts):
+                        reason = 'dir:ignored'
+                    else:
+                        reason = 'unknown'
+
+                    stats['skip_reasons'][reason] = stats['skip_reasons'].get(reason, 0) + 1
+                    processed += 1
                     continue
 
                 result = self.index_file(str(file_path), project_name)
@@ -247,44 +391,56 @@ class FileIndexer:
                         'path': str(file_path),
                         'chunks': result.get('chunks', 0)
                     })
+                    if len(stats['files']) % 100 == 0:
+                        print(f"✅ [{len(stats['files'])}/{total_files}] файлов проиндексировано")
                 elif result.get('status') == 'error':
                     stats['errors'] += 1
 
                 processed += 1
 
-        stats['message'] = f"Indexed {stats['indexed']} chunks from {len(stats['files'])} files"
+        # ✅ Печатаем статистику
+        print(f"\n📊 ИТОГИ:")
+        print(f"   Папок: {len(stats['directories'])}")
+        print(f"   Файлов: {len(stats['files'])}")
+        print(f"   Чанков: {stats['indexed']}")
+        print(f"   Пропущено: {stats['skipped']}")
+
+        if stats['skip_reasons']:
+            print(f"\n⚠️ Причины пропуска (топ-5):")
+            for reason, count in sorted(stats['skip_reasons'].items(), key=lambda x: -x[1])[:5]:
+                print(f"   {reason}: {count}")
+
+        stats[
+            'message'] = f"Indexed {len(stats['directories'])} directories + {len(stats['files'])} files ({stats['indexed']} chunks)"
         return stats
 
     # ========================================================================
     # ПОИСК
     # ========================================================================
 
-    def search_indexed(self, query: str, limit: int = 10, project_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Поиск по проиндексированным файлам
-
-        Args:
-            query: Поисковый запрос
-            limit: Количество результатов
-            project_filter: Фильтр по проекту
-
-        Returns:
-            Список найденных документов
-        """
+    def search_indexed(
+            self,
+            query: str,
+            limit: int = 10,
+            project_filter: Optional[str] = None,
+            include_directories: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Поиск по проиндексированным файлам и папкам"""
         embedding = self.model.encode(query, normalize_embeddings=True)
         vector = list(embedding)
 
-        # Создаём фильтр по проекту если указан
-        query_filter = None
+        must_conditions = []
         if project_filter:
-            query_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key='project',
-                        match=MatchValue(value=project_filter)
-                    )
-                ]
+            must_conditions.append(
+                FieldCondition(key='project', match=MatchValue(value=project_filter))
             )
+
+        if not include_directories:
+            must_conditions.append(
+                FieldCondition(key='type', match=MatchValue(value='file'))
+            )
+
+        query_filter = Filter(must=must_conditions) if must_conditions else None
 
         response = self.client.query_points(
             collection_name=self.collection_name,
@@ -295,32 +451,37 @@ class FileIndexer:
             with_vectors=False,
         )
 
-        return [
-            {
-                'path': r.payload.get('path', '') if r.payload else '',
-                'file_name': r.payload.get('file_name', '') if r.payload else '',
-                'content': r.payload.get('content', '') if r.payload else '',
-                'score': float(r.score) if r.score else 0.0,
-                'project': r.payload.get('project', '') if r.payload else '',
-            }
-            for r in response.points
-        ]
+        results = []
+        for r in response.points:
+            if r.payload:
+                result = {
+                    'path': r.payload.get('path', ''),
+                    'file_name': r.payload.get('file_name', ''),
+                    'content': r.payload.get('content', ''),
+                    'score': float(r.score) if r.score else 0.0,
+                    'project': r.payload.get('project', ''),
+                    'type': r.payload.get('type', 'file'),
+                }
+
+                if result['type'] == 'directory':
+                    result['subdirectories'] = r.payload.get('subdirectories', [])
+                    result['files_count'] = r.payload.get('files_count', 0)
+
+                results.append(result)
+
+        return results
 
     # ========================================================================
     # УПРАВЛЕНИЕ ИНДЕКСОМ
     # ========================================================================
 
-    def get_indexed_files(self, project_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Возвращает список всех проиндексированных файлов
-
-        Args:
-            project_name: Фильтр по проекту
-
-        Returns:
-            Список файлов с метаданными
-        """
-        files = {}
+    def get_indexed_files(
+            self,
+            project_name: Optional[str] = None,
+            include_directories: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Возвращает список всех проиндексированных файлов (и опционально папок)"""
+        items = {}
         offset = None
 
         while True:
@@ -335,38 +496,86 @@ class FileIndexer:
             for record in records:
                 if record.payload:
                     path = record.payload.get('path', '')
-                    if path and path not in files:
-                        files[path] = {
+                    item_type = record.payload.get('type', 'file')
+
+                    if not include_directories and item_type == 'directory':
+                        continue
+
+                    if path and path not in items:
+                        item = {
                             'path': path,
                             'file_name': record.payload.get('file_name', ''),
                             'file_ext': record.payload.get('file_ext', ''),
                             'project': record.payload.get('project', ''),
                             'chunks': record.payload.get('total_chunks', 1),
-                            'indexed_at': record.payload.get('indexed_at', 0)
+                            'indexed_at': record.payload.get('indexed_at', 0),
+                            'type': item_type,
                         }
+
+                        if item_type == 'directory':
+                            item['subdirectories'] = record.payload.get('subdirectories', [])
+                            item['files_count'] = record.payload.get('files_count', 0)
+
+                        items[path] = item
 
             if offset is None:
                 break
 
         if project_name:
-            files = {k: v for k, v in files.items() if v.get('project') == project_name}
+            items = {k: v for k, v in items.items() if v.get('project') == project_name}
 
-        return list(files.values())
+        return list(items.values())
+
+    def get_project_structure(self, max_depth: int = 3) -> Dict[str, Any]:
+        """Возвращает структуру проекта как дерево"""
+        all_items = self.get_indexed_files(include_directories=True)
+
+        directories = [i for i in all_items if i.get('type') == 'directory']
+        files = [i for i in all_items if i.get('type') != 'directory']
+
+        def build_tree(path: str, depth: int = 0) -> Dict[str, Any]:
+            if depth > max_depth:
+                return {}
+
+            node = {
+                'name': Path(path).name or path,
+                'path': path,
+                'type': 'directory',
+                'children': {},
+                'files': []
+            }
+
+            for d in directories:
+                d_path = d['path']
+                if d_path.startswith(path + '/') and d_path.count('/') == path.count('/') + 1:
+                    node['children'][d['file_name']] = build_tree(d_path, depth + 1)
+
+            for f in files:
+                f_path = f['path']
+                if f_path.startswith(path + '/') and f_path.count('/') == path.count('/') + 1:
+                    node['files'].append({
+                        'name': f['file_name'],
+                        'path': f['path'],
+                        'ext': f['file_ext']
+                    })
+
+            return node
+
+        root_paths = set()
+        for d in directories:
+            parts = d['path'].split('/')
+            if len(parts) <= max_depth + 2:
+                root_paths.add('/'.join(parts[:max_depth + 2]))
+
+        root_path = min(root_paths) if root_paths else '/'
+
+        return build_tree(root_path)
 
     def delete_file_index(self, file_path: str) -> Dict[str, Any]:
-        """
-        Удаляет индексацию конкретного файла
-
-        Args:
-            file_path: Путь к файлу
-
-        Returns:
-            Статус операции
-        """
+        """Удаляет индексацию конкретного файла"""
         path = str(Path(file_path).absolute())
 
         try:
-            # Находим все точки для этого файла
             file_filter = Filter(
                 must=[
                     FieldCondition(
@@ -376,13 +585,11 @@ class FileIndexer:
                 ]
             )
 
-            # Считаем сколько точек будет удалено
             count_result = self.client.count(
                 collection_name=self.collection_name,
                 count_filter=file_filter
             )
 
-            # Удаляем точки
             self.client.delete(
                 collection_name=self.collection_name,
                 points_selector=file_filter
@@ -400,20 +607,8 @@ class FileIndexer:
             }
 
     def update_file_index(self, file_path: str, project_name: str = 'default') -> Dict[str, Any]:
-        """
-        Обновляет индексацию файла (удаляет старую + индексирует заново)
-
-        Args:
-            file_path: Путь к файлу
-            project_name: Имя проекта
-
-        Returns:
-            Статус операции
-        """
-        # Сначала удаляем старую индексацию
+        """Обновляет индексацию файла"""
         delete_result = self.delete_file_index(file_path)
-
-        # Затем индексируем заново
         index_result = self.index_file(file_path, project_name)
 
         return {
@@ -423,20 +618,13 @@ class FileIndexer:
         }
 
     def clear_collection(self) -> Dict[str, Any]:
-        """
-        Очищает всю коллекцию
-
-        Returns:
-            Статус операции
-        """
+        """Очищает всю коллекцию"""
         try:
-            # Считаем количество точек перед очисткой
             count_result = self.client.count(
                 collection_name=self.collection_name,
                 count_filter=None
             )
 
-            # Пересоздаём коллекцию
             self.client.delete_collection(self.collection_name)
             self._ensure_collection()
 
@@ -452,16 +640,7 @@ class FileIndexer:
             }
 
     def count_indexed(self, project_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Считает количество проиндексированных точек
-
-        Args:
-            project_name: Фильтр по проекту
-
-        Returns:
-            Количество точек и файлов
-        """
-        # Общий подсчёт
+        """Считает количество проиндексированных точек"""
         filter_condition = None
         if project_name:
             filter_condition = Filter(
@@ -479,7 +658,6 @@ class FileIndexer:
             exact=True
         )
 
-        # Получаем уникальные файлы
         files = self.get_indexed_files(project_name)
 
         return {
@@ -490,12 +668,7 @@ class FileIndexer:
         }
 
     def get_collection_info(self) -> Dict[str, Any]:
-        """
-        Получает информацию о коллекции
-
-        Returns:
-            Информация о коллекции
-        """
+        """Получает информацию о коллекции"""
         try:
             info = self.client.get_collection(self.collection_name)
 
@@ -514,15 +687,7 @@ class FileIndexer:
             }
 
     def is_file_indexed(self, file_path: str) -> Dict[str, Any]:
-        """
-        Проверяет проиндексирован ли файл
-
-        Args:
-            file_path: Путь к файлу
-
-        Returns:
-            Статус индексации
-        """
+        """Проверяет проиндексирован ли файл"""
         path = str(Path(file_path).absolute())
 
         file_filter = Filter(
