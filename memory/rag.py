@@ -3,7 +3,8 @@
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
-from sentence_transformers import SentenceTransformer
+
+from memory.embedding_model import get_embedding_model
 
 
 class QdrantRetriever:
@@ -11,7 +12,7 @@ class QdrantRetriever:
 
     def __init__(self, qdrant_url='http://localhost:6333'):
         self.client = QdrantClient(url=qdrant_url)
-        self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        self.model = get_embedding_model()
         self.collection = 'ue_project'
         self.vector_size = self.model.get_sentence_embedding_dimension() or 384
         self._ensure_collection()

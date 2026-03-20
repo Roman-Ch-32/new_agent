@@ -15,7 +15,8 @@ from qdrant_client.models import (
     FieldCondition,
     MatchValue
 )
-from sentence_transformers import SentenceTransformer
+
+from memory.embedding_model import get_embedding_model
 
 
 class FileIndexer:
@@ -65,7 +66,7 @@ class FileIndexer:
     ):
         self.client = QdrantClient(url=qdrant_url)
         self.collection_name = collection_name
-        self.model = SentenceTransformer(model_name)
+        self.model = get_embedding_model(model_name)
         self.vector_size = self.model.get_sentence_embedding_dimension() or 384
         self._ensure_collection()
 
